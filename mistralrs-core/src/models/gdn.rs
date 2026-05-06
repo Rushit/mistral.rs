@@ -846,6 +846,7 @@ impl GatedDeltaNet {
             let (output, new_conv_state) = crate::cuda::gdn::causal_conv1d_cuda(
                 &x_t,
                 &weight,
+                None,
                 &conv_state,
                 self.conv_kernel_size,
                 true,
@@ -865,6 +866,7 @@ impl GatedDeltaNet {
             let (output, new_conv_state) = crate::metal::gdn::causal_conv1d_metal(
                 &x_t,
                 &weight,
+                None,
                 &conv_state,
                 true,
                 self.conv_kernel_size,
@@ -911,6 +913,7 @@ impl GatedDeltaNet {
             let (output, new_conv_state) = crate::cuda::gdn::causal_conv1d_cuda(
                 &x_t,
                 &weight,
+                None,
                 &cache.conv_state,
                 self.conv_kernel_size,
                 false,
@@ -929,6 +932,7 @@ impl GatedDeltaNet {
             let (output, new_conv_state) = crate::metal::gdn::causal_conv1d_metal(
                 &x_t,
                 &weight,
+                None,
                 &cache.conv_state,
                 false,
                 self.conv_kernel_size,
