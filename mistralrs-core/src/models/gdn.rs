@@ -229,22 +229,21 @@ pub fn gated_delta_rule_recurrence_dispatch(
 
         const CHUNK_THRESHOLD: usize = 64;
 
-        // CUDA kernels require F32 inputs; Metal kernels are templated on T
-        // and accept the native model dtype directly (no conversion needed).
+        // CUDA and Metal kernels are both templated on T now and accept the
+        // native model dtype directly — no F32 conversion needed on either.
         #[cfg(feature = "cuda")]
         if q.device().is_cuda() {
-            let q_bh = (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?
-                .reshape((batch_size * num_v_heads, seq_len, head_k_dim))?
-                .contiguous()?;
-            let k_bh = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?
+            let q_bh = (q.transpose(1, 2)?.contiguous()? * scale)?
                 .reshape((batch_size * num_v_heads, seq_len, head_k_dim))?.contiguous()?;
-            let v_bh = v.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?
+            let k_bh = k.transpose(1, 2)?.contiguous()?
+                .reshape((batch_size * num_v_heads, seq_len, head_k_dim))?.contiguous()?;
+            let v_bh = v.transpose(1, 2)?.contiguous()?
                 .reshape((batch_size * num_v_heads, seq_len, head_v_dim))?.contiguous()?;
-            let g_bh = g.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?
+            let g_bh = g.transpose(1, 2)?.contiguous()?
                 .reshape((batch_size * num_v_heads, seq_len))?.contiguous()?;
-            let beta_bh = beta.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?
+            let beta_bh = beta.transpose(1, 2)?.contiguous()?
                 .reshape((batch_size * num_v_heads, seq_len))?.contiguous()?;
-            let mut state_flat = state.to_dtype(DType::F32)?
+            let mut state_flat = state
                 .reshape((batch_size * num_v_heads, head_k_dim, head_v_dim))?.contiguous()?;
             let out_bh = if seq_len >= CHUNK_THRESHOLD {
                 crate::cuda::gdn::chunked_gated_delta_rule_recurrence_cuda(
@@ -256,11 +255,10 @@ pub fn gated_delta_rule_recurrence_dispatch(
                 )?
             };
             *state = state_flat
-                .reshape((batch_size, num_v_heads, head_k_dim, head_v_dim))?
-                .to_dtype(state.dtype())?;
-            return out_bh
+                .reshape((batch_size, num_v_heads, head_k_dim, head_v_dim))?;
+            return Ok(out_bh
                 .reshape((batch_size, num_v_heads, seq_len, head_v_dim))?
-                .transpose(1, 2)?.contiguous()?.to_dtype(dtype);
+                .transpose(1, 2)?.contiguous()?);
         }
 
         #[cfg(feature = "metal")]
@@ -840,29 +838,27 @@ impl GatedDeltaNet {
         let v_head = self.head_v_dim;
         let scale = 1.0 / (k_head as f64).sqrt();
 
-        let q_bh = (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?
+        // CUDA kernels are templated on T — pass tensors in native model dtype
+        // directly, no F32 casts needed.
+        let q_bh = (q.transpose(1, 2)?.contiguous()? * scale)?
             .reshape((batch_size * num_heads, seq_len, k_head))?
             .contiguous()?;
         let k_bh = k
             .transpose(1, 2)?
             .contiguous()?
-            .to_dtype(DType::F32)?
             .reshape((batch_size * num_heads, seq_len, k_head))?
             .contiguous()?;
         let v_bh = v
             .transpose(1, 2)?
             .contiguous()?
-            .to_dtype(DType::F32)?
             .reshape((batch_size * num_heads, seq_len, v_head))?
             .contiguous()?;
         let g_bh = g
-            .to_dtype(DType::F32)?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((batch_size * num_heads, seq_len))?
             .contiguous()?;
         let beta_bh = beta
-            .to_dtype(DType::F32)?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((batch_size * num_heads, seq_len))?
@@ -870,7 +866,6 @@ impl GatedDeltaNet {
 
         let mut state_flat = cache
             .recurrent_state
-            .to_dtype(DType::F32)?
             .reshape((batch_size * num_heads, k_head, v_head))?
             .contiguous()?;
 
@@ -895,9 +890,8 @@ impl GatedDeltaNet {
             )?
         };
 
-        cache.recurrent_state = state_flat
-            .reshape((batch_size, num_heads, k_head, v_head))?
-            .to_dtype(cache.recurrent_state.dtype())?;
+        cache.recurrent_state =
+            state_flat.reshape((batch_size, num_heads, k_head, v_head))?;
 
         out_bh
             .reshape((batch_size, num_heads, seq_len, v_head))?

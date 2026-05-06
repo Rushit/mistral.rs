@@ -22,16 +22,19 @@
 // state: [BH, K, V] (in/out)  output: [BH, S, V]
 // ============================================================================
 
-// Optimized kernel: BK known at compile time -> registers + full unrolling
-template <int BK, int BV>
+// Optimized kernel: BK known at compile time -> registers + full unrolling.
+// Templated on T so device I/O can be F16/BF16 (model dtype) directly while
+// arithmetic stays in float registers — eliminates the dispatcher's
+// to_dtype(F32) casts.
+template <int BK, int BV, typename T>
 __global__ void gated_delta_rule_recurrence_kernel_tiled(
-    const float *__restrict__ q,    // [BH, S, K]
-    const float *__restrict__ k,    // [BH, S, K]
-    const float *__restrict__ v,    // [BH, S, V]
-    const float *__restrict__ g,    // [BH, S]
-    const float *__restrict__ beta, // [BH, S]
-    float *__restrict__ state,      // [BH, K, V]
-    float *__restrict__ output,     // [BH, S, V]
+    const T *__restrict__ q,    // [BH, S, K]
+    const T *__restrict__ k,    // [BH, S, K]
+    const T *__restrict__ v,    // [BH, S, V]
+    const T *__restrict__ g,    // [BH, S]
+    const T *__restrict__ beta, // [BH, S]
+    T *__restrict__ state,      // [BH, K, V]
+    T *__restrict__ output,     // [BH, S, V]
     int seq_len, int v_dim) {
 
   const int v_tile = blockIdx.x;       // which V-tile
@@ -43,15 +46,15 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     return;
 
   // Pointers for this (batch, head)
-  const float *q_bh = q + bh * seq_len * BK;
-  const float *k_bh = k + bh * seq_len * BK;
-  const float *v_bh = v + bh * seq_len * v_dim;
-  const float *g_bh = g + bh * seq_len;
-  const float *beta_bh = beta + bh * seq_len;
-  float *state_bh = state + bh * BK * v_dim;
-  float *out_bh = output + bh * seq_len * v_dim;
+  const T *q_bh = q + bh * seq_len * BK;
+  const T *k_bh = k + bh * seq_len * BK;
+  const T *v_bh = v + bh * seq_len * v_dim;
+  const T *g_bh = g + bh * seq_len;
+  const T *beta_bh = beta + bh * seq_len;
+  T *state_bh = state + bh * BK * v_dim;
+  T *out_bh = output + bh * seq_len * v_dim;
 
-  // Shared memory: k_buf[BK] + q_buf[BK]
+  // Shared memory: k_buf[BK] + q_buf[BK]   (always float for accumulation)
   __shared__ float k_buf[BK];
   __shared__ float q_buf[BK];
 
@@ -60,7 +63,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
   float s[BK];
 #pragma unroll
   for (int j = 0; j < BK; j++) {
-    s[j] = state_bh[j * v_dim + v_idx];
+    s[j] = (float)state_bh[j * v_dim + v_idx];
   }
 
   for (int t = 0; t < seq_len; t++) {
@@ -68,14 +71,14 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
 // BK / BV loads per thread (e.g. 128/64 = 2)
 #pragma unroll
     for (int j = tid; j < BK; j += BV) {
-      k_buf[j] = k_bh[t * BK + j];
+      k_buf[j] = (float)k_bh[t * BK + j];
     }
     __syncthreads();
 
     // Load scalars for this timestep
-    float decay = expf(g_bh[t]);
-    float beta_t = beta_bh[t];
-    float v_t = v_bh[t * v_dim + v_idx];
+    float decay = expf((float)g_bh[t]);
+    float beta_t = (float)beta_bh[t];
+    float v_t = (float)v_bh[t * v_dim + v_idx];
 
     // Fused pass 1: decay state + compute kv_mem
     float kv_mem = 0.0f;
@@ -91,7 +94,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
 // Collaboratively load q_t into shared memory
 #pragma unroll
     for (int j = tid; j < BK; j += BV) {
-      q_buf[j] = q_bh[t * BK + j];
+      q_buf[j] = (float)q_bh[t * BK + j];
     }
     __syncthreads();
 
@@ -103,7 +106,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
       y_t = __fmaf_rn(s[j], q_buf[j], y_t);
     }
 
-    out_bh[t * v_dim + v_idx] = y_t;
+    out_bh[t * v_dim + v_idx] = (T)y_t;
 
     __syncthreads();
   }
@@ -111,17 +114,17 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
 // Write state back
 #pragma unroll
   for (int j = 0; j < BK; j++) {
-    state_bh[j * v_dim + v_idx] = s[j];
+    state_bh[j * v_dim + v_idx] = (T)s[j];
   }
 }
 
 // Fallback kernel: runtime k_dim, still V-tiled for occupancy
-template <int BV, int MAX_K>
+template <int BV, int MAX_K, typename T>
 __global__ void gated_delta_rule_recurrence_kernel_fallback(
-    const float *__restrict__ q, const float *__restrict__ k,
-    const float *__restrict__ v, const float *__restrict__ g,
-    const float *__restrict__ beta, float *__restrict__ state,
-    float *__restrict__ output, int seq_len, int k_dim, int v_dim) {
+    const T *__restrict__ q, const T *__restrict__ k,
+    const T *__restrict__ v, const T *__restrict__ g,
+    const T *__restrict__ beta, T *__restrict__ state,
+    T *__restrict__ output, int seq_len, int k_dim, int v_dim) {
 
   const int v_tile = blockIdx.x;
   const int bh = blockIdx.y;
@@ -131,13 +134,13 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
   if (v_idx >= v_dim)
     return;
 
-  const float *q_bh = q + bh * seq_len * k_dim;
-  const float *k_bh = k + bh * seq_len * k_dim;
-  const float *v_bh = v + bh * seq_len * v_dim;
-  const float *g_bh = g + bh * seq_len;
-  const float *beta_bh = beta + bh * seq_len;
-  float *state_bh = state + bh * k_dim * v_dim;
-  float *out_bh = output + bh * seq_len * v_dim;
+  const T *q_bh = q + bh * seq_len * k_dim;
+  const T *k_bh = k + bh * seq_len * k_dim;
+  const T *v_bh = v + bh * seq_len * v_dim;
+  const T *g_bh = g + bh * seq_len;
+  const T *beta_bh = beta + bh * seq_len;
+  T *state_bh = state + bh * k_dim * v_dim;
+  T *out_bh = output + bh * seq_len * v_dim;
 
   extern __shared__ float shared[];
   float *k_buf = shared;
@@ -145,18 +148,18 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
   float s[MAX_K];
   for (int j = 0; j < k_dim; j++) {
-    s[j] = state_bh[j * v_dim + v_idx];
+    s[j] = (float)state_bh[j * v_dim + v_idx];
   }
 
   for (int t = 0; t < seq_len; t++) {
     for (int j = tid; j < k_dim; j += BV) {
-      k_buf[j] = k_bh[t * k_dim + j];
+      k_buf[j] = (float)k_bh[t * k_dim + j];
     }
     __syncthreads();
 
-    float decay = expf(g_bh[t]);
-    float beta_t = beta_bh[t];
-    float v_t = v_bh[t * v_dim + v_idx];
+    float decay = expf((float)g_bh[t]);
+    float beta_t = (float)beta_bh[t];
+    float v_t = (float)v_bh[t * v_dim + v_idx];
 
     float kv_mem = 0.0f;
     for (int j = 0; j < k_dim; j++) {
@@ -167,7 +170,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     float delta = (v_t - kv_mem) * beta_t;
 
     for (int j = tid; j < k_dim; j += BV) {
-      q_buf[j] = q_bh[t * k_dim + j];
+      q_buf[j] = (float)q_bh[t * k_dim + j];
     }
     __syncthreads();
 
@@ -177,54 +180,76 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
       y_t = __fmaf_rn(s[j], q_buf[j], y_t);
     }
 
-    out_bh[t * v_dim + v_idx] = y_t;
+    out_bh[t * v_dim + v_idx] = (T)y_t;
 
     __syncthreads();
   }
 
   for (int j = 0; j < k_dim; j++) {
-    state_bh[j * v_dim + v_idx] = s[j];
+    state_bh[j * v_dim + v_idx] = (T)s[j];
   }
 }
 
-extern "C" void gated_delta_rule_recurrence(const float *q, const float *k,
-                                            const float *v, const float *g,
-                                            const float *beta, float *state,
-                                            float *output, int bh, int seq_len,
-                                            int k_dim, int v_dim,
+extern "C" void gated_delta_rule_recurrence(const void *q, const void *k,
+                                            const void *v, const void *g,
+                                            const void *beta, void *state,
+                                            void *output, int bh, int seq_len,
+                                            int k_dim, int v_dim, int dtype,
                                             int64_t stream) {
 
   const cudaStream_t custream = (cudaStream_t)stream;
 
+#define LAUNCH_TILED(BK_VAL, T)                                                \
+  do {                                                                         \
+    constexpr int BV = 64;                                                     \
+    dim3 grid((v_dim + BV - 1) / BV, bh);                                      \
+    dim3 block(BV);                                                            \
+    gated_delta_rule_recurrence_kernel_tiled<BK_VAL, BV, T>                    \
+        <<<grid, block, 0, custream>>>(                                        \
+            (const T *)q, (const T *)k, (const T *)v, (const T *)g,            \
+            (const T *)beta, (T *)state, (T *)output, seq_len, v_dim);         \
+  } while (0)
+
+#define LAUNCH_FALLBACK(T)                                                     \
+  do {                                                                         \
+    constexpr int BV = 64;                                                     \
+    constexpr int MAX_K = 256;                                                 \
+    dim3 grid((v_dim + BV - 1) / BV, bh);                                      \
+    dim3 block(BV);                                                            \
+    size_t smem = 2 * k_dim * sizeof(float);                                   \
+    gated_delta_rule_recurrence_kernel_fallback<BV, MAX_K, T>                  \
+        <<<grid, block, smem, custream>>>(                                     \
+            (const T *)q, (const T *)k, (const T *)v, (const T *)g,            \
+            (const T *)beta, (T *)state, (T *)output, seq_len, k_dim, v_dim);  \
+  } while (0)
+
   if (k_dim == 128) {
-    // Fast path for Qwen3-Next (k_dim=128)
-    constexpr int BK = 128;
-    constexpr int BV = 64;
-    dim3 grid((v_dim + BV - 1) / BV, bh);
-    dim3 block(BV);
-    gated_delta_rule_recurrence_kernel_tiled<BK, BV>
-        <<<grid, block, 0, custream>>>(q, k, v, g, beta, state, output, seq_len,
-                                       v_dim);
+    if (dtype == 0) {
+      LAUNCH_TILED(128, __half);
+    } else if (dtype == 1) {
+      LAUNCH_TILED(128, __nv_bfloat16);
+    } else {
+      LAUNCH_TILED(128, float);
+    }
   } else if (k_dim == 64) {
-    // Fast path for models with k_dim=64
-    constexpr int BK = 64;
-    constexpr int BV = 64;
-    dim3 grid((v_dim + BV - 1) / BV, bh);
-    dim3 block(BV);
-    gated_delta_rule_recurrence_kernel_tiled<BK, BV>
-        <<<grid, block, 0, custream>>>(q, k, v, g, beta, state, output, seq_len,
-                                       v_dim);
+    if (dtype == 0) {
+      LAUNCH_TILED(64, __half);
+    } else if (dtype == 1) {
+      LAUNCH_TILED(64, __nv_bfloat16);
+    } else {
+      LAUNCH_TILED(64, float);
+    }
   } else {
-    // Fallback for other k_dim values (runtime loop, still V-tiled)
-    constexpr int BV = 64;
-    constexpr int MAX_K = 256;
-    dim3 grid((v_dim + BV - 1) / BV, bh);
-    dim3 block(BV);
-    size_t smem = 2 * k_dim * sizeof(float);
-    gated_delta_rule_recurrence_kernel_fallback<BV, MAX_K>
-        <<<grid, block, smem, custream>>>(q, k, v, g, beta, state, output,
-                                          seq_len, k_dim, v_dim);
+    if (dtype == 0) {
+      LAUNCH_FALLBACK(__half);
+    } else if (dtype == 1) {
+      LAUNCH_FALLBACK(__nv_bfloat16);
+    } else {
+      LAUNCH_FALLBACK(float);
+    }
   }
+#undef LAUNCH_TILED
+#undef LAUNCH_FALLBACK
 }
 
 // ============================================================================
@@ -249,15 +274,15 @@ extern "C" void gated_delta_rule_recurrence(const float *q, const float *k,
 // state: [BH, K, V] (in/out)  output: [BH, S, V]
 // ============================================================================
 
-template <int BT, int BK, int BV>
+template <int BT, int BK, int BV, typename T>
 __global__ void
-chunked_gated_delta_rule_kernel(const float *__restrict__ q,    // [BH, S, K]
-                                const float *__restrict__ k,    // [BH, S, K]
-                                const float *__restrict__ v,    // [BH, S, V]
-                                const float *__restrict__ g,    // [BH, S]
-                                const float *__restrict__ beta, // [BH, S]
-                                float *__restrict__ state,      // [BH, K, V]
-                                float *__restrict__ output,     // [BH, S, V]
+chunked_gated_delta_rule_kernel(const T *__restrict__ q,    // [BH, S, K]
+                                const T *__restrict__ k,    // [BH, S, K]
+                                const T *__restrict__ v,    // [BH, S, V]
+                                const T *__restrict__ g,    // [BH, S]
+                                const T *__restrict__ beta, // [BH, S]
+                                T *__restrict__ state,      // [BH, K, V]
+                                T *__restrict__ output,     // [BH, S, V]
                                 int seq_len, int v_dim) {
 
   const int v_tile = blockIdx.x;
@@ -271,15 +296,15 @@ chunked_gated_delta_rule_kernel(const float *__restrict__ q,    // [BH, S, K]
   const int num_chunks = (seq_len + BT - 1) / BT;
 
   // Pointers for this (batch, head)
-  const float *q_bh = q + bh * seq_len * BK;
-  const float *k_bh = k + bh * seq_len * BK;
-  const float *v_bh = v + bh * seq_len * v_dim;
-  const float *g_bh = g + bh * seq_len;
-  const float *beta_bh = beta + bh * seq_len;
-  float *state_bh = state + bh * BK * v_dim;
-  float *out_bh = output + bh * seq_len * v_dim;
+  const T *q_bh = q + bh * seq_len * BK;
+  const T *k_bh = k + bh * seq_len * BK;
+  const T *v_bh = v + bh * seq_len * v_dim;
+  const T *g_bh = g + bh * seq_len;
+  const T *beta_bh = beta + bh * seq_len;
+  T *state_bh = state + bh * BK * v_dim;
+  T *out_bh = output + bh * seq_len * v_dim;
 
-  // Dynamic shared memory layout
+  // Dynamic shared memory layout (always float for accumulation)
   extern __shared__ float smem[];
   float *k_chunk = smem;                  // [BT * BK]
   float *kk_dot = smem + BT * BK;         // [BT * BT]
@@ -291,7 +316,7 @@ chunked_gated_delta_rule_kernel(const float *__restrict__ q,    // [BH, S, K]
   float s[BK];
 #pragma unroll
   for (int j = 0; j < BK; j++) {
-    s[j] = state_bh[j * v_dim + v_idx];
+    s[j] = (float)state_bh[j * v_dim + v_idx];
   }
 
   // Per-thread register array for corrected deltas
@@ -304,12 +329,12 @@ chunked_gated_delta_rule_kernel(const float *__restrict__ q,    // [BH, S, K]
     // === Phase 1: Cooperative load of k, beta, g into shared memory ===
     for (int t = 0; t < chunk_len; t++) {
       for (int j = tid; j < BK; j += BV) {
-        k_chunk[t * BK + j] = k_bh[(chunk_start + t) * BK + j];
+        k_chunk[t * BK + j] = (float)k_bh[(chunk_start + t) * BK + j];
       }
     }
     if (tid < chunk_len) {
-      beta_s[tid] = beta_bh[chunk_start + tid];
-      gcum[tid] = g_bh[chunk_start + tid];
+      beta_s[tid] = (float)beta_bh[chunk_start + tid];
+      gcum[tid] = (float)g_bh[chunk_start + tid];
     }
     __syncthreads();
 
@@ -342,7 +367,7 @@ chunked_gated_delta_rule_kernel(const float *__restrict__ q,    // [BH, S, K]
     // === Phase 3: Forward substitution (per V-column, in registers) ===
     // Computes corrected delta values via triangular solve
     for (int i = 0; i < chunk_len; i++) {
-      float v_i = v_bh[(chunk_start + i) * v_dim + v_idx];
+      float v_i = (float)v_bh[(chunk_start + i) * v_dim + v_idx];
       float decay_i = expf(gcum[i]);
       float beta_i = beta_s[i];
 
@@ -367,7 +392,7 @@ chunked_gated_delta_rule_kernel(const float *__restrict__ q,    // [BH, S, K]
     for (int i = 0; i < chunk_len; i++) {
       // Cooperatively load q[i] into shared
       for (int j = tid; j < BK; j += BV) {
-        q_buf[j] = q_bh[(chunk_start + i) * BK + j];
+        q_buf[j] = (float)q_bh[(chunk_start + i) * BK + j];
       }
       __syncthreads();
 
@@ -390,7 +415,7 @@ chunked_gated_delta_rule_kernel(const float *__restrict__ q,    // [BH, S, K]
         o_val += qk_dot * delta[j] * expf(gcum[i] - gcum[j]);
       }
 
-      out_bh[(chunk_start + i) * v_dim + v_idx] = o_val;
+      out_bh[(chunk_start + i) * v_dim + v_idx] = (T)o_val;
       __syncthreads();
     }
 
@@ -411,52 +436,54 @@ chunked_gated_delta_rule_kernel(const float *__restrict__ q,    // [BH, S, K]
   // Write final state back
 #pragma unroll
   for (int j = 0; j < BK; j++) {
-    state_bh[j * v_dim + v_idx] = s[j];
+    state_bh[j * v_dim + v_idx] = (T)s[j];
   }
 }
 
 extern "C" void chunked_gated_delta_rule_recurrence(
-    const float *q, const float *k, const float *v, const float *g,
-    const float *beta, float *state, float *output, int bh, int seq_len,
-    int k_dim, int v_dim, int64_t stream) {
+    const void *q, const void *k, const void *v, const void *g,
+    const void *beta, void *state, void *output, int bh, int seq_len,
+    int k_dim, int v_dim, int dtype, int64_t stream) {
 
   const cudaStream_t custream = (cudaStream_t)stream;
 
+#define LAUNCH_CHUNKED(BK_VAL, T)                                              \
+  do {                                                                         \
+    constexpr int BT = 64;                                                     \
+    constexpr int BV = 64;                                                     \
+    size_t smem = (BT * BK_VAL + BT * BT + 2 * BT + BK_VAL) * sizeof(float);   \
+    auto kernel = chunked_gated_delta_rule_kernel<BT, BK_VAL, BV, T>;          \
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,  \
+                         smem);                                                \
+    dim3 grid((v_dim + BV - 1) / BV, bh);                                      \
+    dim3 block(BV);                                                            \
+    kernel<<<grid, block, smem, custream>>>(                                   \
+        (const T *)q, (const T *)k, (const T *)v, (const T *)g,                \
+        (const T *)beta, (T *)state, (T *)output, seq_len, v_dim);             \
+  } while (0)
+
   if (k_dim == 128) {
-    constexpr int BT = 64;
-    constexpr int BK = 128;
-    constexpr int BV = 64;
-    // Shared memory: BT*BK + BT*BT + BT + BT + BK floats
-    size_t smem = (BT * BK + BT * BT + 2 * BT + BK) * sizeof(float);
-
-    // Request extended shared memory
-    auto kernel = chunked_gated_delta_rule_kernel<BT, BK, BV>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem);
-
-    dim3 grid((v_dim + BV - 1) / BV, bh);
-    dim3 block(BV);
-    kernel<<<grid, block, smem, custream>>>(q, k, v, g, beta, state, output,
-                                            seq_len, v_dim);
+    if (dtype == 0) {
+      LAUNCH_CHUNKED(128, __half);
+    } else if (dtype == 1) {
+      LAUNCH_CHUNKED(128, __nv_bfloat16);
+    } else {
+      LAUNCH_CHUNKED(128, float);
+    }
   } else if (k_dim == 64) {
-    constexpr int BT = 64;
-    constexpr int BK = 64;
-    constexpr int BV = 64;
-    size_t smem = (BT * BK + BT * BT + 2 * BT + BK) * sizeof(float);
-
-    auto kernel = chunked_gated_delta_rule_kernel<BT, BK, BV>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem);
-
-    dim3 grid((v_dim + BV - 1) / BV, bh);
-    dim3 block(BV);
-    kernel<<<grid, block, smem, custream>>>(q, k, v, g, beta, state, output,
-                                            seq_len, v_dim);
+    if (dtype == 0) {
+      LAUNCH_CHUNKED(64, __half);
+    } else if (dtype == 1) {
+      LAUNCH_CHUNKED(64, __nv_bfloat16);
+    } else {
+      LAUNCH_CHUNKED(64, float);
+    }
   } else {
     // Fallback: use the sequential kernel for unsupported k_dim
     gated_delta_rule_recurrence(q, k, v, g, beta, state, output, bh, seq_len,
-                                k_dim, v_dim, stream);
+                                k_dim, v_dim, dtype, stream);
   }
+#undef LAUNCH_CHUNKED
 }
 
 // ============================================================================

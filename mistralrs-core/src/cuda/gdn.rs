@@ -7,8 +7,10 @@ use candle_core::DType;
 
 /// CUDA-accelerated gated delta rule recurrence.
 ///
-/// Inputs (all contiguous, f32):
-///   q, k: [BH, S, K]  v: [BH, S, V]  g, beta: [BH, S]
+/// Templated on dtype so the kernel reads/writes the model dtype directly
+/// (F16/BF16/F32). Float arithmetic stays in registers.
+///
+///   q, k: [BH, S, K]   v: [BH, S, V]   g, beta: [BH, S]
 ///   state: [BH, K, V] (mutated in place)
 ///
 /// Returns: output [BH, S, V]
@@ -23,83 +25,102 @@ pub fn gated_delta_rule_recurrence_cuda(
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
+    use core::ffi::c_void;
 
-    let (bh, seq_len, k_dim) = q.dims3()?;
-    let v_dim = v.dim(2)?;
+    fn cuda_fwd<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state: &mut Tensor,
+        dtype_code: i32,
+    ) -> Result<Tensor> {
+        let (bh, seq_len, k_dim) = q.dims3()?;
+        let v_dim = v.dim(2)?;
+        let dev = q.device().as_cuda_device()?;
 
-    let dev = q.device().as_cuda_device()?;
+        let (q_s, q_l) = q.storage_and_layout();
+        let q_s = match &*q_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("q must be a cuda tensor"),
+        };
+        let q_offset = q_l.start_offset();
 
-    let (q_s, q_l) = q.storage_and_layout();
-    let q_s = match &*q_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("q must be a cuda tensor"),
-    };
-    let q_offset = q_l.start_offset();
+        let (k_s, k_l) = k.storage_and_layout();
+        let k_s = match &*k_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("k must be a cuda tensor"),
+        };
+        let k_offset = k_l.start_offset();
 
-    let (k_s, k_l) = k.storage_and_layout();
-    let k_s = match &*k_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("k must be a cuda tensor"),
-    };
-    let k_offset = k_l.start_offset();
+        let (v_s, v_l) = v.storage_and_layout();
+        let v_s = match &*v_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("v must be a cuda tensor"),
+        };
+        let v_offset = v_l.start_offset();
 
-    let (v_s, v_l) = v.storage_and_layout();
-    let v_s = match &*v_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("v must be a cuda tensor"),
-    };
-    let v_offset = v_l.start_offset();
+        let (g_s, g_l) = g.storage_and_layout();
+        let g_s = match &*g_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("g must be a cuda tensor"),
+        };
+        let g_offset = g_l.start_offset();
 
-    let (g_s, g_l) = g.storage_and_layout();
-    let g_s = match &*g_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("g must be a cuda tensor"),
-    };
-    let g_offset = g_l.start_offset();
+        let (beta_s, beta_l) = beta.storage_and_layout();
+        let beta_s = match &*beta_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("beta must be a cuda tensor"),
+        };
+        let beta_offset = beta_l.start_offset();
 
-    let (beta_s, beta_l) = beta.storage_and_layout();
-    let beta_s = match &*beta_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("beta must be a cuda tensor"),
-    };
-    let beta_offset = beta_l.start_offset();
+        let (state_s, state_l) = state.storage_and_layout();
+        let state_s = match &*state_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("state must be a cuda tensor"),
+        };
+        let state_offset = state_l.start_offset();
 
-    let (state_s, state_l) = state.storage_and_layout();
-    let state_s = match &*state_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("state must be a cuda tensor"),
-    };
-    let state_offset = state_l.start_offset();
+        let output_buf = unsafe { dev.alloc::<T>(bh * seq_len * v_dim) }?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
 
-    let output_buf = unsafe { dev.alloc::<f32>(bh * seq_len * v_dim) }?;
+        unsafe {
+            crate::cuda::ffi::gated_delta_rule_recurrence(
+                q_s.slice(q_offset..).device_ptr(q_s.stream()).0 as *const c_void,
+                k_s.slice(k_offset..).device_ptr(k_s.stream()).0 as *const c_void,
+                v_s.slice(v_offset..).device_ptr(v_s.stream()).0 as *const c_void,
+                g_s.slice(g_offset..).device_ptr(g_s.stream()).0 as *const c_void,
+                beta_s.slice(beta_offset..).device_ptr(beta_s.stream()).0 as *const c_void,
+                state_s.slice(state_offset..).device_ptr(state_s.stream()).0 as *mut c_void,
+                output_buf.device_ptr(output_buf.stream()).0 as *mut c_void,
+                bh as i32,
+                seq_len as i32,
+                k_dim as i32,
+                v_dim as i32,
+                dtype_code,
+                stream,
+            );
+        }
 
-    let stream = dev.cuda_stream().cu_stream() as i64;
-
-    unsafe {
-        crate::cuda::ffi::gated_delta_rule_recurrence(
-            q_s.slice(q_offset..).device_ptr(q_s.stream()).0 as *const f32,
-            k_s.slice(k_offset..).device_ptr(k_s.stream()).0 as *const f32,
-            v_s.slice(v_offset..).device_ptr(v_s.stream()).0 as *const f32,
-            g_s.slice(g_offset..).device_ptr(g_s.stream()).0 as *const f32,
-            beta_s.slice(beta_offset..).device_ptr(beta_s.stream()).0 as *const f32,
-            state_s.slice(state_offset..).device_ptr(state_s.stream()).0 as *mut f32,
-            output_buf.device_ptr(output_buf.stream()).0 as *mut f32,
-            bh as i32,
-            seq_len as i32,
-            k_dim as i32,
-            v_dim as i32,
-            stream,
-        );
+        let output_storage = candle::CudaStorage::wrap_cuda_slice(output_buf, dev.clone());
+        Ok(Tensor::from((
+            candle::Storage::Cuda(output_storage),
+            (bh, seq_len, v_dim),
+        )))
     }
 
-    // The kernel wrote state in-place via the raw pointer; rewrap
-    // (state tensor's underlying CudaSlice was modified directly)
-
-    let output_storage = candle::CudaStorage::wrap_cuda_slice(output_buf, dev.clone());
-    Ok(Tensor::from((
-        candle::Storage::Cuda(output_storage),
-        (bh, seq_len, v_dim),
-    )))
+    match q.dtype() {
+        DType::F16 => cuda_fwd::<half::f16>(q, k, v, g, beta, state, 0),
+        DType::BF16 => cuda_fwd::<half::bf16>(q, k, v, g, beta, state, 1),
+        DType::F32 => cuda_fwd::<f32>(q, k, v, g, beta, state, 2),
+        other => candle_core::bail!(
+            "gated_delta_rule_recurrence_cuda only supports f16/bf16/f32, got {:?}",
+            other
+        ),
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -136,80 +157,102 @@ pub fn chunked_gated_delta_rule_recurrence_cuda(
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
+    use core::ffi::c_void;
 
-    let (bh, seq_len, k_dim) = q.dims3()?;
-    let v_dim = v.dim(2)?;
+    fn cuda_fwd<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state: &mut Tensor,
+        dtype_code: i32,
+    ) -> Result<Tensor> {
+        let (bh, seq_len, k_dim) = q.dims3()?;
+        let v_dim = v.dim(2)?;
+        let dev = q.device().as_cuda_device()?;
 
-    let dev = q.device().as_cuda_device()?;
+        let (q_s, q_l) = q.storage_and_layout();
+        let q_s = match &*q_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("q must be a cuda tensor"),
+        };
+        let q_offset = q_l.start_offset();
 
-    let (q_s, q_l) = q.storage_and_layout();
-    let q_s = match &*q_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("q must be a cuda tensor"),
-    };
-    let q_offset = q_l.start_offset();
+        let (k_s, k_l) = k.storage_and_layout();
+        let k_s = match &*k_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("k must be a cuda tensor"),
+        };
+        let k_offset = k_l.start_offset();
 
-    let (k_s, k_l) = k.storage_and_layout();
-    let k_s = match &*k_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("k must be a cuda tensor"),
-    };
-    let k_offset = k_l.start_offset();
+        let (v_s, v_l) = v.storage_and_layout();
+        let v_s = match &*v_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("v must be a cuda tensor"),
+        };
+        let v_offset = v_l.start_offset();
 
-    let (v_s, v_l) = v.storage_and_layout();
-    let v_s = match &*v_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("v must be a cuda tensor"),
-    };
-    let v_offset = v_l.start_offset();
+        let (g_s, g_l) = g.storage_and_layout();
+        let g_s = match &*g_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("g must be a cuda tensor"),
+        };
+        let g_offset = g_l.start_offset();
 
-    let (g_s, g_l) = g.storage_and_layout();
-    let g_s = match &*g_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("g must be a cuda tensor"),
-    };
-    let g_offset = g_l.start_offset();
+        let (beta_s, beta_l) = beta.storage_and_layout();
+        let beta_s = match &*beta_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("beta must be a cuda tensor"),
+        };
+        let beta_offset = beta_l.start_offset();
 
-    let (beta_s, beta_l) = beta.storage_and_layout();
-    let beta_s = match &*beta_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("beta must be a cuda tensor"),
-    };
-    let beta_offset = beta_l.start_offset();
+        let (state_s, state_l) = state.storage_and_layout();
+        let state_s = match &*state_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("state must be a cuda tensor"),
+        };
+        let state_offset = state_l.start_offset();
 
-    let (state_s, state_l) = state.storage_and_layout();
-    let state_s = match &*state_s {
-        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle::bail!("state must be a cuda tensor"),
-    };
-    let state_offset = state_l.start_offset();
+        let output_buf = unsafe { dev.alloc::<T>(bh * seq_len * v_dim) }?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
 
-    let output_buf = unsafe { dev.alloc::<f32>(bh * seq_len * v_dim) }?;
+        unsafe {
+            crate::cuda::ffi::chunked_gated_delta_rule_recurrence(
+                q_s.slice(q_offset..).device_ptr(q_s.stream()).0 as *const c_void,
+                k_s.slice(k_offset..).device_ptr(k_s.stream()).0 as *const c_void,
+                v_s.slice(v_offset..).device_ptr(v_s.stream()).0 as *const c_void,
+                g_s.slice(g_offset..).device_ptr(g_s.stream()).0 as *const c_void,
+                beta_s.slice(beta_offset..).device_ptr(beta_s.stream()).0 as *const c_void,
+                state_s.slice(state_offset..).device_ptr(state_s.stream()).0 as *mut c_void,
+                output_buf.device_ptr(output_buf.stream()).0 as *mut c_void,
+                bh as i32,
+                seq_len as i32,
+                k_dim as i32,
+                v_dim as i32,
+                dtype_code,
+                stream,
+            );
+        }
 
-    let stream = dev.cuda_stream().cu_stream() as i64;
-
-    unsafe {
-        crate::cuda::ffi::chunked_gated_delta_rule_recurrence(
-            q_s.slice(q_offset..).device_ptr(q_s.stream()).0 as *const f32,
-            k_s.slice(k_offset..).device_ptr(k_s.stream()).0 as *const f32,
-            v_s.slice(v_offset..).device_ptr(v_s.stream()).0 as *const f32,
-            g_s.slice(g_offset..).device_ptr(g_s.stream()).0 as *const f32,
-            beta_s.slice(beta_offset..).device_ptr(beta_s.stream()).0 as *const f32,
-            state_s.slice(state_offset..).device_ptr(state_s.stream()).0 as *mut f32,
-            output_buf.device_ptr(output_buf.stream()).0 as *mut f32,
-            bh as i32,
-            seq_len as i32,
-            k_dim as i32,
-            v_dim as i32,
-            stream,
-        );
+        let output_storage = candle::CudaStorage::wrap_cuda_slice(output_buf, dev.clone());
+        Ok(Tensor::from((
+            candle::Storage::Cuda(output_storage),
+            (bh, seq_len, v_dim),
+        )))
     }
 
-    let output_storage = candle::CudaStorage::wrap_cuda_slice(output_buf, dev.clone());
-    Ok(Tensor::from((
-        candle::Storage::Cuda(output_storage),
-        (bh, seq_len, v_dim),
-    )))
+    match q.dtype() {
+        DType::F16 => cuda_fwd::<half::f16>(q, k, v, g, beta, state, 0),
+        DType::BF16 => cuda_fwd::<half::bf16>(q, k, v, g, beta, state, 1),
+        DType::F32 => cuda_fwd::<f32>(q, k, v, g, beta, state, 2),
+        other => candle_core::bail!(
+            "chunked_gated_delta_rule_recurrence_cuda only supports f16/bf16/f32, got {:?}",
+            other
+        ),
+    }
 }
 
 #[cfg(not(feature = "cuda"))]

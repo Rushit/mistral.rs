@@ -297,34 +297,38 @@ extern "C" {
         stream: i64,
     );
 
-    // GDN (Gated Delta Net) kernels for qwen3_next
+    // GDN (Gated Delta Net) kernels for qwen3_next.
+    // dtype: 0 = f16, 1 = bf16, 2 = f32. Buffers are typed accordingly; arithmetic
+    // happens in float registers regardless.
     pub(crate) fn gated_delta_rule_recurrence(
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        g: *const f32,
-        beta: *const f32,
-        state: *mut f32,
-        output: *mut f32,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut c_void,
+        output: *mut c_void,
         bh: i32,
         seq_len: i32,
         k_dim: i32,
         v_dim: i32,
+        dtype: i32,
         stream: i64,
     );
     // Chunked GDN recurrence for prefill (processes tokens in BT=64 chunks)
     pub(crate) fn chunked_gated_delta_rule_recurrence(
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        g: *const f32,
-        beta: *const f32,
-        state: *mut f32,
-        output: *mut f32,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut c_void,
+        output: *mut c_void,
         bh: i32,
         seq_len: i32,
         k_dim: i32,
         v_dim: i32,
+        dtype: i32,
         stream: i64,
     );
     pub(crate) fn causal_conv1d_update(
