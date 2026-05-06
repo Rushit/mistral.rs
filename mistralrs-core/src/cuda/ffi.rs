@@ -364,4 +364,34 @@ extern "C" {
         dtype: i32,
         stream: i64,
     );
+    // GDN slot-indexed decode kernels (in-place pool updates, no gather/scatter)
+    pub(crate) fn gated_delta_rule_decode_slots(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state_pool: *mut c_void,
+        output: *mut c_void,
+        slots: *const u32,
+        batch: i32,
+        num_heads: i32,
+        k_dim: i32,
+        v_dim: i32,
+        dtype: i32,
+        stream: i64,
+    );
+    pub(crate) fn causal_conv1d_update_slots(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        conv_state_pool: *mut c_void,
+        output: *mut c_void,
+        slots: *const u32,
+        batch_size: i32,
+        conv_dim: i32,
+        kernel_size: i32,
+        dtype: i32,
+        stream: i64,
+    );
 }

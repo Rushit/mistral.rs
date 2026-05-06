@@ -708,3 +708,213 @@ extern "C" void fused_gdn_gating(const void *b, const void *a,
         num_heads);
   }
 }
+
+// ============================================================================
+// Kernel 4: gated_delta_rule_decode_slots (decode path, in-place pool update)
+//
+// Specialized decode kernel (seq_len=1) that reads/writes state directly in
+// the global pool buffer via a per-batch slot index — no gather/scatter.
+//
+// Templated on T so the pool stays in model dtype (F16/BF16) and arithmetic
+// runs in float registers, matching the Metal slots kernel.
+//
+// q, k: [batch*heads, BK]   v: [batch*heads, V]
+// g, beta: [batch*heads]
+// state_pool: [pool_size*heads, BK, V]   output: [batch*heads, V]
+// slots: [batch] (uint32_t — maps batch index to pool row)
+// ============================================================================
+
+template <int BK, int BV, typename T>
+__global__ void gated_delta_rule_decode_slots_kernel(
+    const T *__restrict__ q,             // [BH, BK]
+    const T *__restrict__ k,             // [BH, BK]
+    const T *__restrict__ v,             // [BH, V]
+    const T *__restrict__ g,             // [BH]
+    const T *__restrict__ beta,          // [BH]
+    T *__restrict__ state_pool,          // [pool*heads, BK, V]
+    T *__restrict__ output,              // [BH, V]
+    const uint32_t *__restrict__ slots,  // [batch]
+    int v_dim, int num_heads) {
+
+  const int v_tile = blockIdx.x;
+  const int bh = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int v_idx = v_tile * BV + tid;
+
+  if (v_idx >= v_dim)
+    return;
+
+  const int b = bh / num_heads;
+  const int h = bh - b * num_heads;
+  const int slot = (int)slots[b];
+  const int state_row = slot * num_heads + h;
+
+  const T *q_bh = q + bh * BK;
+  const T *k_bh = k + bh * BK;
+  const T *v_bh = v + bh * v_dim;
+  float g_t = (float)g[bh];
+  float beta_t = (float)beta[bh];
+
+  T *state_bh = state_pool + state_row * BK * v_dim;
+  T *out_bh = output + bh * v_dim;
+
+  __shared__ float k_buf[BK];
+  __shared__ float q_buf[BK];
+
+  // Cooperatively load k into shared memory
+#pragma unroll
+  for (int j = tid; j < BK; j += BV) {
+    k_buf[j] = (float)k_bh[j];
+  }
+  __syncthreads();
+
+  float decay = expf(g_t);
+  float v_t = (float)v_bh[v_idx];
+
+  // Load state column, apply decay, accumulate kv_mem
+  float s[BK];
+  float kv_mem = 0.0f;
+#pragma unroll
+  for (int j = 0; j < BK; j++) {
+    s[j] = (float)state_bh[j * v_dim + v_idx] * decay;
+    kv_mem = __fmaf_rn(s[j], k_buf[j], kv_mem);
+  }
+
+  float delta = (v_t - kv_mem) * beta_t;
+
+  // Cooperatively load q into shared memory
+#pragma unroll
+  for (int j = tid; j < BK; j += BV) {
+    q_buf[j] = (float)q_bh[j];
+  }
+  __syncthreads();
+
+  // Update state column + compute output
+  float y_t = 0.0f;
+#pragma unroll
+  for (int j = 0; j < BK; j++) {
+    s[j] = __fmaf_rn(k_buf[j], delta, s[j]);
+    y_t = __fmaf_rn(s[j], q_buf[j], y_t);
+  }
+
+  out_bh[v_idx] = (T)y_t;
+
+  // Write updated state back to pool
+#pragma unroll
+  for (int j = 0; j < BK; j++) {
+    state_bh[j * v_dim + v_idx] = (T)s[j];
+  }
+}
+
+extern "C" void gated_delta_rule_decode_slots(
+    const void *q, const void *k, const void *v,
+    const void *g, const void *beta,
+    void *state_pool, void *output,
+    const uint32_t *slots,
+    int batch, int num_heads, int k_dim, int v_dim,
+    int dtype, int64_t stream) {
+  const cudaStream_t custream = (cudaStream_t)stream;
+  const int bh = batch * num_heads;
+  constexpr int BV = 64;
+  dim3 grid((v_dim + BV - 1) / BV, bh);
+  dim3 block(BV);
+
+#define LAUNCH_DECODE_SLOTS(BK_VAL, T)                                         \
+  gated_delta_rule_decode_slots_kernel<BK_VAL, BV, T>                          \
+      <<<grid, block, 0, custream>>>(                                          \
+          (const T *)q, (const T *)k, (const T *)v, (const T *)g,              \
+          (const T *)beta, (T *)state_pool, (T *)output, slots, v_dim,         \
+          num_heads);
+
+  if (k_dim == 128) {
+    if (dtype == 0) {
+      LAUNCH_DECODE_SLOTS(128, __half);
+    } else if (dtype == 1) {
+      LAUNCH_DECODE_SLOTS(128, __nv_bfloat16);
+    } else {
+      LAUNCH_DECODE_SLOTS(128, float);
+    }
+  } else if (k_dim == 64) {
+    if (dtype == 0) {
+      LAUNCH_DECODE_SLOTS(64, __half);
+    } else if (dtype == 1) {
+      LAUNCH_DECODE_SLOTS(64, __nv_bfloat16);
+    } else {
+      LAUNCH_DECODE_SLOTS(64, float);
+    }
+  }
+  // k_dim ∉ {64, 128}: caller must fall back to gather/scatter
+#undef LAUNCH_DECODE_SLOTS
+}
+
+// ============================================================================
+// Kernel 5: causal_conv1d_update_slots (decode path, in-place pool update)
+//
+// Same as causal_conv1d_update_kernel but addresses conv_state_pool via a
+// per-batch slot index — no gather/scatter.
+// ============================================================================
+
+template <typename T>
+__global__ void causal_conv1d_update_slots_kernel(
+    const T *__restrict__ x,             // [batch, conv_dim]
+    const T *__restrict__ weight,        // [conv_dim, kernel_size]
+    const T *__restrict__ bias,          // [conv_dim] or NULL
+    T *__restrict__ conv_state_pool,     // [pool, conv_dim, kernel_size]
+    T *__restrict__ output,              // [batch, conv_dim]
+    const uint32_t *__restrict__ slots,  // [batch]
+    int batch_size, int conv_dim, int kernel_size) {
+
+  const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+  const int b = blockIdx.y;
+
+  if (ch >= conv_dim || b >= batch_size)
+    return;
+
+  const int slot = (int)slots[b];
+  T *cs = conv_state_pool + (slot * conv_dim + ch) * kernel_size;
+  const T *w = weight + ch * kernel_size;
+
+  // Shift state left by 1
+  for (int i = 0; i < kernel_size - 1; i++) {
+    cs[i] = cs[i + 1];
+  }
+  cs[kernel_size - 1] = x[b * conv_dim + ch];
+
+  // Dot product
+  float acc = 0.0f;
+  for (int i = 0; i < kernel_size; i++) {
+    acc += (float)cs[i] * (float)w[i];
+  }
+
+  if (bias != nullptr) {
+    acc += (float)bias[ch];
+  }
+
+  // SiLU
+  float sig = 1.0f / (1.0f + expf(-acc));
+  output[b * conv_dim + ch] = (T)(acc * sig);
+}
+
+extern "C" void causal_conv1d_update_slots(
+    const void *x, const void *weight, const void *bias,
+    void *conv_state_pool, void *output,
+    const uint32_t *slots,
+    int batch_size, int conv_dim, int kernel_size,
+    int dtype, int64_t stream) {
+  const cudaStream_t custream = (cudaStream_t)stream;
+  dim3 block(256);
+  dim3 grid((conv_dim + 255) / 256, batch_size);
+
+  if (dtype == 0) {
+    causal_conv1d_update_slots_kernel<__half><<<grid, block, 0, custream>>>(
+        (const __half *)x, (const __half *)weight, (const __half *)bias,
+        (__half *)conv_state_pool, (__half *)output, slots,
+        batch_size, conv_dim, kernel_size);
+  } else {
+    causal_conv1d_update_slots_kernel<__nv_bfloat16>
+        <<<grid, block, 0, custream>>>(
+            (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)weight,
+            (const __nv_bfloat16 *)bias, (__nv_bfloat16 *)conv_state_pool,
+            (__nv_bfloat16 *)output, slots, batch_size, conv_dim, kernel_size);
+  }
+}

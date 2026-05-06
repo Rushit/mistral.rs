@@ -507,8 +507,10 @@ impl GdnWeights {
     }
 
     /// Decode-step forward pass that operates on the global state pool directly
-    /// via slot indices — no gather/scatter. Metal-only fast path for `seq_len=1`.
-    #[cfg(feature = "metal")]
+    /// via slot indices — no gather/scatter. Fast path for `seq_len=1`.
+    /// Metal and CUDA share the same Rust-side flow; the underlying kernel
+    /// dispatch picks the device-specific slots kernel.
+    #[cfg(any(feature = "metal", feature = "cuda"))]
     fn forward_decode_slots(
         &self,
         x: &Tensor,
@@ -541,14 +543,39 @@ impl GdnWeights {
             .squeeze(1)?
             .to_dtype(mixed_t.dtype())?
             .contiguous()?;
-        let conv_out = crate::metal::gdn::causal_conv1d_update_slots_metal(
-            &mixed_t,
-            &weight_2d,
-            self.conv_bias.as_ref(),
-            conv_state_pool,
-            slots_gpu,
-            self.conv_kernel_size,
-        )?; // [batch, conv_dim]
+        let conv_out = {
+            #[cfg(feature = "metal")]
+            if mixed_t.device().is_metal() {
+                crate::metal::gdn::causal_conv1d_update_slots_metal(
+                    &mixed_t,
+                    &weight_2d,
+                    self.conv_bias.as_ref(),
+                    conv_state_pool,
+                    slots_gpu,
+                    self.conv_kernel_size,
+                )?
+            } else {
+                crate::cuda::gdn::causal_conv1d_update_slots_cuda(
+                    &mixed_t,
+                    &weight_2d,
+                    self.conv_bias.as_ref(),
+                    conv_state_pool,
+                    slots_gpu,
+                    self.conv_kernel_size,
+                )?
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                crate::cuda::gdn::causal_conv1d_update_slots_cuda(
+                    &mixed_t,
+                    &weight_2d,
+                    self.conv_bias.as_ref(),
+                    conv_state_pool,
+                    slots_gpu,
+                    self.conv_kernel_size,
+                )?
+            }
+        }; // [batch, conv_dim]
         let mixed_conv = conv_out.unsqueeze(1)?; // [batch, 1, conv_dim]
 
         // 3. Split after conv
@@ -616,16 +643,45 @@ impl GdnWeights {
             .reshape((bh,))?
             .contiguous()?;
 
-        let y_bh = crate::metal::gdn::gated_delta_rule_decode_slots_metal(
-            &q_bh,
-            &k_bh,
-            &v_bh,
-            &g_bh,
-            &beta_bh,
-            recurrent_state_pool,
-            slots_gpu,
-            self.num_v_heads,
-        )?; // [bh, value_head_dim]
+        let y_bh = {
+            #[cfg(feature = "metal")]
+            if q_bh.device().is_metal() {
+                crate::metal::gdn::gated_delta_rule_decode_slots_metal(
+                    &q_bh,
+                    &k_bh,
+                    &v_bh,
+                    &g_bh,
+                    &beta_bh,
+                    recurrent_state_pool,
+                    slots_gpu,
+                    self.num_v_heads,
+                )?
+            } else {
+                crate::cuda::gdn::gated_delta_rule_decode_slots_cuda(
+                    &q_bh,
+                    &k_bh,
+                    &v_bh,
+                    &g_bh,
+                    &beta_bh,
+                    recurrent_state_pool,
+                    slots_gpu,
+                    self.num_v_heads,
+                )?
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                crate::cuda::gdn::gated_delta_rule_decode_slots_cuda(
+                    &q_bh,
+                    &k_bh,
+                    &v_bh,
+                    &g_bh,
+                    &beta_bh,
+                    recurrent_state_pool,
+                    slots_gpu,
+                    self.num_v_heads,
+                )?
+            }
+        }; // [bh, value_head_dim]
 
         // [bh, v_dim] → [batch, num_heads, 1, v_dim] → [batch, 1, num_heads, v_dim]
         let y = y_bh
@@ -1283,12 +1339,18 @@ impl ModelWeights {
                         let first_offset =
                             pool.get_seqlen_offset(indices_vec[0] as usize);
 
-                        // Metal decode fast path: address pool directly via slots,
-                        // skipping per-layer gather/scatter (~112 Metal dispatches/token saved).
-                        #[cfg(feature = "metal")]
+                        // Slots fast path (Metal+CUDA): address pool directly via
+                        // slot indices, skipping per-layer gather/scatter.
+                        // The slots kernels only support k_dim ∈ {64, 128} — fall
+                        // back to gather/scatter if the model uses a different size.
+                        #[cfg(any(feature = "metal", feature = "cuda"))]
                         {
                             let is_decode = first_offset > 0 && x.dim(1)? == 1;
-                            if x.device().is_metal() && is_decode {
+                            let dev_supports_slots =
+                                x.device().is_metal() || x.device().is_cuda();
+                            let k_dim_ok =
+                                gdn.key_head_dim == 64 || gdn.key_head_dim == 128;
+                            if is_decode && dev_supports_slots && k_dim_ok {
                                 let slots_gpu = indices.to_device(x.device())?;
                                 let out = gdn.forward_decode_slots(
                                     &x,
@@ -1320,7 +1382,7 @@ impl ModelWeights {
                                 out
                             }
                         }
-                        #[cfg(not(feature = "metal"))]
+                        #[cfg(not(any(feature = "metal", feature = "cuda")))]
                         {
                             let conv_state = pool.gather_conv_state(indices)?;
                             let recurrent_state = pool.gather_recurrent_state(indices)?;

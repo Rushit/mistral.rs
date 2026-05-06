@@ -495,3 +495,280 @@ pub fn fused_gdn_gating_cuda(
 ) -> Result<(Tensor, Tensor)> {
     candle_core::bail!("fused_gdn_gating_cuda requires the cuda feature")
 }
+
+// ============================================================================
+// Public API: decode slots (no gather/scatter — kernels index pool directly)
+// ============================================================================
+
+/// Decode-step gated delta rule recurrence that updates the state pool in-place.
+///
+/// Mirrors the Metal slots kernel: a per-batch slot index addresses the global
+/// pool buffer directly so we skip gather → kernel → scatter.
+///
+/// q, k: [batch*heads, k_dim]   v: [batch*heads, v_dim]
+/// g, beta: [batch*heads]
+/// state_pool: [pool_size, num_heads, k_dim, v_dim]   (mutated in-place)
+/// slots_gpu: [batch] U32 on the CUDA device
+/// Returns: output [batch*heads, v_dim]
+#[cfg(feature = "cuda")]
+pub fn gated_delta_rule_decode_slots_cuda(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state_pool: &mut Tensor,
+    slots_gpu: &Tensor,
+    num_heads: usize,
+) -> Result<Tensor> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core as candle;
+    use core::ffi::c_void;
+
+    fn cuda_fwd<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state_pool: &mut Tensor,
+        slots_gpu: &Tensor,
+        num_heads: usize,
+        dtype_code: i32,
+    ) -> Result<Tensor> {
+        let dev = q.device().as_cuda_device()?;
+
+        let bh = q.dim(0)?;
+        let k_dim = q.dim(1)?;
+        let v_dim = v.dim(1)?;
+        let batch = bh / num_heads;
+
+        let (q_s, q_l) = q.storage_and_layout();
+        let q_s = match &*q_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("q must be a cuda tensor"),
+        };
+        let q_offset = q_l.start_offset();
+
+        let (k_s, k_l) = k.storage_and_layout();
+        let k_s = match &*k_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("k must be a cuda tensor"),
+        };
+        let k_offset = k_l.start_offset();
+
+        let (v_s, v_l) = v.storage_and_layout();
+        let v_s = match &*v_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("v must be a cuda tensor"),
+        };
+        let v_offset = v_l.start_offset();
+
+        let (g_s, g_l) = g.storage_and_layout();
+        let g_s = match &*g_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("g must be a cuda tensor"),
+        };
+        let g_offset = g_l.start_offset();
+
+        let (beta_s, beta_l) = beta.storage_and_layout();
+        let beta_s = match &*beta_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("beta must be a cuda tensor"),
+        };
+        let beta_offset = beta_l.start_offset();
+
+        let (state_s, state_l) = state_pool.storage_and_layout();
+        let state_s = match &*state_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("state_pool must be a cuda tensor"),
+        };
+        let state_offset = state_l.start_offset();
+
+        let (slots_s, slots_l) = slots_gpu.storage_and_layout();
+        let slots_s = match &*slots_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("slots must be a cuda tensor"),
+        };
+        let slots_offset = slots_l.start_offset();
+
+        let output_buf = unsafe { dev.alloc::<T>(bh * v_dim) }?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
+
+        unsafe {
+            crate::cuda::ffi::gated_delta_rule_decode_slots(
+                q_s.slice(q_offset..).device_ptr(q_s.stream()).0 as *const c_void,
+                k_s.slice(k_offset..).device_ptr(k_s.stream()).0 as *const c_void,
+                v_s.slice(v_offset..).device_ptr(v_s.stream()).0 as *const c_void,
+                g_s.slice(g_offset..).device_ptr(g_s.stream()).0 as *const c_void,
+                beta_s.slice(beta_offset..).device_ptr(beta_s.stream()).0 as *const c_void,
+                state_s.slice(state_offset..).device_ptr(state_s.stream()).0 as *mut c_void,
+                output_buf.device_ptr(output_buf.stream()).0 as *mut c_void,
+                slots_s.slice(slots_offset..).device_ptr(slots_s.stream()).0 as *const u32,
+                batch as i32,
+                num_heads as i32,
+                k_dim as i32,
+                v_dim as i32,
+                dtype_code,
+                stream,
+            );
+        }
+
+        let output_storage = candle::CudaStorage::wrap_cuda_slice(output_buf, dev.clone());
+        Ok(Tensor::from((
+            candle::Storage::Cuda(output_storage),
+            (bh, v_dim),
+        )))
+    }
+
+    match q.dtype() {
+        DType::F16 => cuda_fwd::<half::f16>(q, k, v, g, beta, state_pool, slots_gpu, num_heads, 0),
+        DType::BF16 => cuda_fwd::<half::bf16>(q, k, v, g, beta, state_pool, slots_gpu, num_heads, 1),
+        DType::F32 => cuda_fwd::<f32>(q, k, v, g, beta, state_pool, slots_gpu, num_heads, 2),
+        other => candle_core::bail!(
+            "gated_delta_rule_decode_slots_cuda only supports f16/bf16/f32, got {:?}",
+            other
+        ),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(unused)]
+pub fn gated_delta_rule_decode_slots_cuda(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _g: &Tensor,
+    _beta: &Tensor,
+    _state_pool: &mut Tensor,
+    _slots_gpu: &Tensor,
+    _num_heads: usize,
+) -> Result<Tensor> {
+    candle_core::bail!("gated_delta_rule_decode_slots_cuda requires the cuda feature")
+}
+
+/// Decode-step causal conv1d that updates the conv state pool in-place.
+///
+/// x_t: [batch, conv_dim]   weight: [conv_dim, kernel_size]
+/// conv_state_pool: [pool_size, conv_dim, kernel_size]  (mutated in-place)
+/// slots_gpu: [batch] U32 on the CUDA device
+/// Returns: output [batch, conv_dim]
+#[cfg(feature = "cuda")]
+pub fn causal_conv1d_update_slots_cuda(
+    x_t: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    conv_state_pool: &mut Tensor,
+    slots_gpu: &Tensor,
+    kernel_size: usize,
+) -> Result<Tensor> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core as candle;
+    use core::ffi::c_void;
+
+    fn cuda_fwd<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        x_t: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        conv_state_pool: &mut Tensor,
+        slots_gpu: &Tensor,
+        kernel_size: usize,
+        dtype_code: i32,
+    ) -> Result<Tensor> {
+        let dev = x_t.device().as_cuda_device()?;
+        let batch_size = x_t.dim(0)?;
+        let conv_dim = x_t.dim(1)?;
+
+        let (x_s, x_l) = x_t.storage_and_layout();
+        let x_s = match &*x_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("x must be a cuda tensor"),
+        };
+        let x_offset = x_l.start_offset();
+
+        let (w_s, w_l) = weight.storage_and_layout();
+        let w_s = match &*w_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("weight must be a cuda tensor"),
+        };
+        let w_offset = w_l.start_offset();
+
+        let bias_ptr: *const c_void = match bias {
+            Some(b) => {
+                let (b_s, b_l) = b.storage_and_layout();
+                let b_s = match &*b_s {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+                    _ => candle::bail!("bias must be a cuda tensor"),
+                };
+                let b_offset = b_l.start_offset();
+                b_s.slice(b_offset..).device_ptr(b_s.stream()).0 as *const c_void
+            }
+            None => std::ptr::null(),
+        };
+
+        let (cs_s, cs_l) = conv_state_pool.storage_and_layout();
+        let cs_s = match &*cs_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+            _ => candle::bail!("conv_state_pool must be a cuda tensor"),
+        };
+        let cs_offset = cs_l.start_offset();
+
+        let (slots_s, slots_l) = slots_gpu.storage_and_layout();
+        let slots_s = match &*slots_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("slots must be a cuda tensor"),
+        };
+        let slots_offset = slots_l.start_offset();
+
+        let output_buf = unsafe { dev.alloc::<T>(batch_size * conv_dim) }?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
+
+        unsafe {
+            crate::cuda::ffi::causal_conv1d_update_slots(
+                x_s.slice(x_offset..).device_ptr(x_s.stream()).0 as *const c_void,
+                w_s.slice(w_offset..).device_ptr(w_s.stream()).0 as *const c_void,
+                bias_ptr,
+                cs_s.slice(cs_offset..).device_ptr(cs_s.stream()).0 as *mut c_void,
+                output_buf.device_ptr(output_buf.stream()).0 as *mut c_void,
+                slots_s.slice(slots_offset..).device_ptr(slots_s.stream()).0 as *const u32,
+                batch_size as i32,
+                conv_dim as i32,
+                kernel_size as i32,
+                dtype_code,
+                stream,
+            );
+        }
+
+        let output_storage = candle::CudaStorage::wrap_cuda_slice(output_buf, dev.clone());
+        Ok(Tensor::from((
+            candle::Storage::Cuda(output_storage),
+            (batch_size, conv_dim),
+        )))
+    }
+
+    match x_t.dtype() {
+        DType::F16 => cuda_fwd::<half::f16>(x_t, weight, bias, conv_state_pool, slots_gpu, kernel_size, 0),
+        DType::BF16 => cuda_fwd::<half::bf16>(x_t, weight, bias, conv_state_pool, slots_gpu, kernel_size, 1),
+        other => candle_core::bail!(
+            "causal_conv1d_update_slots_cuda only supports f16/bf16, got {:?}",
+            other
+        ),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(unused)]
+pub fn causal_conv1d_update_slots_cuda(
+    _x_t: &Tensor,
+    _weight: &Tensor,
+    _bias: Option<&Tensor>,
+    _conv_state_pool: &mut Tensor,
+    _slots_gpu: &Tensor,
+    _kernel_size: usize,
+) -> Result<Tensor> {
+    candle_core::bail!("causal_conv1d_update_slots_cuda requires the cuda feature")
+}
