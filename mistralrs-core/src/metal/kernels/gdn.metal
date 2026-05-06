@@ -426,7 +426,7 @@ template <typename T>
 
 instantiate_conv1d_update(half);
 #ifdef __HAVE_BFLOAT__
-instantiate_conv1d_update(bfloat16_t);
+instantiate_conv1d_update(bfloat);
 #endif
 
 // ============================================================================
@@ -510,7 +510,7 @@ template <typename T>
 
 instantiate_conv1d_full(half);
 #ifdef __HAVE_BFLOAT__
-instantiate_conv1d_full(bfloat16_t);
+instantiate_conv1d_full(bfloat);
 #endif
 
 // ============================================================================
@@ -559,5 +559,5 @@ template <typename T>
 
 instantiate_gdn_gating(half);
 #ifdef __HAVE_BFLOAT__
-instantiate_gdn_gating(bfloat16_t);
+instantiate_gdn_gating(bfloat);
 #endif
