@@ -584,27 +584,27 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 // Block 0 may be a full-attention or GDN layer; detect by which weights exist.
                 let attn_weights = if self.model.has_tensor("blk.0.attn_q.weight") {
                     // Full-attention block
-                    let attn_q = tensor_info_size_in_bytes!(
-                        self.model.tensor_info("blk.0.attn_q.weight")?
-                    );
-                    let attn_k = tensor_info_size_in_bytes!(
-                        self.model.tensor_info("blk.0.attn_k.weight")?
-                    );
-                    let attn_v = tensor_info_size_in_bytes!(
-                        self.model.tensor_info("blk.0.attn_v.weight")?
-                    );
-                    let attn_output = tensor_info_size_in_bytes!(
-                        self.model.tensor_info("blk.0.attn_output.weight")?
-                    );
+                    let attn_q = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_q.weight")?);
+                    let attn_k = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_k.weight")?);
+                    let attn_v = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_v.weight")?);
+                    let attn_output = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_output.weight")?);
                     attn_q + attn_k + attn_v + attn_output
                 } else {
                     // GDN (linear-attention) block
-                    let qkv = tensor_info_size_in_bytes!(
-                        self.model.tensor_info("blk.0.attn_qkv.weight")?
-                    );
-                    let gate = tensor_info_size_in_bytes!(
-                        self.model.tensor_info("blk.0.attn_gate.weight")?
-                    );
+                    let qkv = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_qkv.weight")?);
+                    let gate = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_gate.weight")?);
                     qkv + gate
                 };
 

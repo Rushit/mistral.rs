@@ -467,7 +467,9 @@ pub fn causal_conv1d_cuda(
 
     match x.dtype() {
         DType::F16 => cuda_fwd::<half::f16>(x, weight, bias, conv_state, kernel_size, is_update, 0),
-        DType::BF16 => cuda_fwd::<half::bf16>(x, weight, bias, conv_state, kernel_size, is_update, 1),
+        DType::BF16 => {
+            cuda_fwd::<half::bf16>(x, weight, bias, conv_state, kernel_size, is_update, 1)
+        }
         other => candle_core::bail!("causal_conv1d_cuda only supports f16/bf16, got {:?}", other),
     }
 }

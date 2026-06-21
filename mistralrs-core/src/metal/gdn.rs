@@ -255,7 +255,9 @@ pub fn chunked_gated_delta_rule_recurrence_metal(
         DType::F32 => "float",
         DType::F16 => "half",
         DType::BF16 => "bfloat16_t",
-        dt => candle_core::bail!("chunked_gated_delta_rule_recurrence_metal: unsupported dtype {dt:?}"),
+        dt => candle_core::bail!(
+            "chunked_gated_delta_rule_recurrence_metal: unsupported dtype {dt:?}"
+        ),
     };
     // BT=32 for all Metal variants (fits 32KB threadgroup memory)
     let kernel_name = match k_dim {
@@ -666,9 +668,7 @@ pub fn gated_delta_rule_decode_slots_metal(
         DType::F32 => "float",
         DType::F16 => "half",
         DType::BF16 => "bfloat16_t",
-        dt => candle_core::bail!(
-            "gated_delta_rule_decode_slots_metal: unsupported dtype {dt:?}"
-        ),
+        dt => candle_core::bail!("gated_delta_rule_decode_slots_metal: unsupported dtype {dt:?}"),
     };
     let kernel_name = match k_dim {
         128 => format!("gated_delta_rule_decode_slots_128_64_{type_suffix}"),
@@ -710,8 +710,16 @@ pub fn gated_delta_rule_decode_slots_metal(
     encoder.set_bytes(9, &num_heads_i32);
 
     let grid_x = (v_dim + bv - 1) / bv;
-    let thread_groups = MTLSize { width: grid_x, height: bh, depth: 1 };
-    let threads_per_group = MTLSize { width: bv, height: 1, depth: 1 };
+    let thread_groups = MTLSize {
+        width: grid_x,
+        height: bh,
+        depth: 1,
+    };
+    let threads_per_group = MTLSize {
+        width: bv,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_thread_groups(thread_groups, threads_per_group);
 
     Ok(output)
@@ -810,7 +818,11 @@ pub fn causal_conv1d_update_slots_metal(
         height: batch_size,
         depth: 1,
     };
-    let threads_per_group = MTLSize { width: 256, height: 1, depth: 1 };
+    let threads_per_group = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_thread_groups(thread_groups, threads_per_group);
 
     Ok(output)

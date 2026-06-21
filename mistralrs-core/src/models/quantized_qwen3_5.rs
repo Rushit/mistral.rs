@@ -16,17 +16,15 @@ use crate::{
     device_map::{DeviceMappedMask, DeviceMapper},
     gguf::Content,
     kv_cache::{
-        EitherCache, HybridCache, HybridCacheConfig, HybridLayerType, KvCache,
-        RecurrentLayerConfig,
+        EitherCache, HybridCache, HybridCacheConfig, HybridLayerType, KvCache, RecurrentLayerConfig,
     },
-    layers::{CausalMaskConfig, CausalMasker, QRmsNorm, RotaryEmbedding, Qwen3VLRotaryEmbedding, Sdpa},
+    layers::{
+        CausalMaskConfig, CausalMasker, QRmsNorm, Qwen3VLRotaryEmbedding, RotaryEmbedding, Sdpa,
+    },
     layers_masker::PastKvLenCache,
     models::gdn::{causal_conv1d_fwd, gated_delta_rule_recurrence, GdnLayerCache},
     paged_attention::{AttentionImplementation, PagedAttention},
-    pipeline::{
-        extract_logits,
-        text_models_inputs_processor::PagedAttentionInputMetadata,
-    },
+    pipeline::{extract_logits, text_models_inputs_processor::PagedAttentionInputMetadata},
     utils::{
         gguf_metadata::ContentMetadata,
         model_config as ModelConfig,
@@ -154,7 +152,10 @@ fn undo_tiled_v_heads_first_dim(
     let dims = x.dims().to_vec();
     let mut reshaped = vec![num_v_per_k, num_k_heads, head_dim];
     reshaped.extend_from_slice(&dims[1..]);
-    x.reshape(reshaped)?.transpose(0, 1)?.contiguous()?.reshape(dims)
+    x.reshape(reshaped)?
+        .transpose(0, 1)?
+        .contiguous()?
+        .reshape(dims)
 }
 
 fn undo_tiled_v_heads_last_dim(
@@ -257,9 +258,15 @@ impl FullAttnWeights {
         };
 
         let (q, k, v) = if seq_len != 1 {
-            let q = q.reshape((b_sz, seq_len, self.n_head, self.head_dim))?.transpose(1, 2)?;
-            let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
-            let v = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+            let q = q
+                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let k = k
+                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let v = v
+                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
             (q, k, v)
         } else {
             let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
@@ -271,8 +278,16 @@ impl FullAttnWeights {
         // Per-head QK RMSNorm (same as Qwen3)
         let q_flat = q.flatten(0, 2)?;
         let k_flat = k.flatten(0, 2)?;
-        let q = self.q_norm.forward(&q_flat)?.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
-        let k = self.k_norm.forward(&k_flat)?.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
+        let q =
+            self.q_norm
+                .forward(&q_flat)?
+                .reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
+        let k = self.k_norm.forward(&k_flat)?.reshape((
+            b_sz,
+            self.n_kv_head,
+            seq_len,
+            self.head_dim,
+        ))?;
 
         // Partial RoPE: rotate first `rope_dim` dims of each head, leave the rest unrotated.
         let positions = crate::pipeline::text_positions_tensor(start_offsets, seq_len, q.device())?;
@@ -280,9 +295,13 @@ impl FullAttnWeights {
             Rotary::Plain(rope) => {
                 if self.rope_dim < self.head_dim {
                     let q_rot = q.narrow(D::Minus1, 0, self.rope_dim)?.contiguous()?;
-                    let q_pass = q.narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?.contiguous()?;
+                    let q_pass = q
+                        .narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?
+                        .contiguous()?;
                     let k_rot = k.narrow(D::Minus1, 0, self.rope_dim)?.contiguous()?;
-                    let k_pass = k.narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?.contiguous()?;
+                    let k_pass = k
+                        .narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?
+                        .contiguous()?;
                     let (q_rot, k_rot) = rope.forward(&q_rot, &k_rot, &positions)?;
                     let q = Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?.contiguous()?;
                     let k = Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?.contiguous()?;
@@ -306,8 +325,12 @@ impl FullAttnWeights {
                 let (cos, sin) = mrope.compute_cos_sin(&pos_ids, self.dtype)?;
 
                 if self.rope_dim < self.head_dim {
-                    let q_pass = q.narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?.contiguous()?;
-                    let k_pass = k.narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?.contiguous()?;
+                    let q_pass = q
+                        .narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?
+                        .contiguous()?;
+                    let k_pass = k
+                        .narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?
+                        .contiguous()?;
                     let mut q_rot = q.narrow(D::Minus1, 0, self.rope_dim)?.contiguous()?;
                     let mut k_rot = k.narrow(D::Minus1, 0, self.rope_dim)?.contiguous()?;
                     mrope.forward(&(cos, sin), &mut q_rot, &mut k_rot)?;
@@ -332,7 +355,17 @@ impl FullAttnWeights {
         let y = match &self.paged_attn {
             Some(pa) => {
                 let ((kc, vc), im) = metadata.unwrap();
-                pa.forward(&q, &k, &v, mask, Some(kc), Some(vc), im, &self.sdpa_params, None)?
+                pa.forward(
+                    &q,
+                    &k,
+                    &v,
+                    mask,
+                    Some(kc),
+                    Some(vc),
+                    im,
+                    &self.sdpa_params,
+                    None,
+                )?
             }
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
@@ -348,8 +381,8 @@ impl FullAttnWeights {
 
         // Apply output gate: y = y * sigmoid(gate)
         let y = if let Some(gate) = gate {
-            let gate_sig = candle_nn::ops::sigmoid(&gate.to_dtype(DType::F32)?)?
-                .to_dtype(y.dtype())?;
+            let gate_sig =
+                candle_nn::ops::sigmoid(&gate.to_dtype(DType::F32)?)?.to_dtype(y.dtype())?;
             y.broadcast_mul(&gate_sig)?
         } else {
             y
@@ -429,7 +462,13 @@ impl GdnWeights {
 
         // 2. Causal conv1d on [q, k, v] (causal_conv1d_fwd already applies silu).
         let mixed = Tensor::cat(&[&q, &k, &v], D::Minus1)?;
-        let mixed = causal_conv1d_fwd(&mixed, &self.conv_weight, self.conv_bias.as_ref(), cache, self.conv_kernel_size)?;
+        let mixed = causal_conv1d_fwd(
+            &mixed,
+            &self.conv_weight,
+            self.conv_bias.as_ref(),
+            cache,
+            self.conv_kernel_size,
+        )?;
 
         // 3. Split back after conv
         let q_c = mixed.narrow(D::Minus1, 0, self.key_dim)?;
@@ -441,9 +480,14 @@ impl GdnWeights {
         let dt_b = self.dt_bias.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, num_v_heads]
         let a_exp = self.a_log.exp()?.neg()?.unsqueeze(0)?.unsqueeze(0)?;
         // softplus(alpha + dt_bias)
-        let sp_in = alpha_raw.to_dtype(DType::F32)?.broadcast_add(&dt_b.to_dtype(DType::F32)?)?;
+        let sp_in = alpha_raw
+            .to_dtype(DType::F32)?
+            .broadcast_add(&dt_b.to_dtype(DType::F32)?)?;
         let sp = (Tensor::ones_like(&sp_in)? + sp_in.exp()?)?.log()?;
-        let g = a_exp.to_dtype(DType::F32)?.broadcast_mul(&sp)?.to_dtype(x.dtype())?;
+        let g = a_exp
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&sp)?
+            .to_dtype(x.dtype())?;
 
         // 5. Reshape for recurrence
         let q_h = q_c.reshape((batch, seq_len, self.num_k_heads, self.key_head_dim))?;
@@ -470,7 +514,8 @@ impl GdnWeights {
         };
 
         // 6. Recurrence
-        let y = gated_delta_rule_recurrence(&q_e, &k_e, &v_h, &g, &beta, &mut cache.recurrent_state)?;
+        let y =
+            gated_delta_rule_recurrence(&q_e, &k_e, &v_h, &g, &beta, &mut cache.recurrent_state)?;
         // y: (batch, seq, num_v_heads, value_head_dim)
 
         // 7. RMSNorm gated by z
@@ -478,7 +523,9 @@ impl GdnWeights {
         let y_flat = y.reshape(((), self.value_head_dim))?;
         let z_flat = z.reshape(((), self.value_head_dim))?;
         let y_normed = rms_norm_gated(&y_flat, &z_flat, &self.norm_weight, self.rms_norm_eps)?;
-        let y_out = y_normed.reshape(val_shape)?.reshape((batch, seq_len, self.value_dim))?;
+        let y_out = y_normed
+            .reshape(val_shape)?
+            .reshape((batch, seq_len, self.value_dim))?;
 
         // 8. Output projection
         cache.seqlen_offset += seq_len;
@@ -536,13 +583,8 @@ impl GdnWeights {
         let v_c = mixed_conv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
 
         // 4. Gating (identical to forward)
-        let (beta, g) = compute_gdn_gating(
-            &beta_raw,
-            &alpha_raw,
-            &self.a_log,
-            &self.dt_bias,
-            x.dtype(),
-        )?;
+        let (beta, g) =
+            compute_gdn_gating(&beta_raw, &alpha_raw, &self.a_log, &self.dt_bias, x.dtype())?;
 
         // 5. Reshape for recurrence
         let q_h = q_c.reshape((batch, seq_len, self.num_k_heads, self.key_head_dim))?;
@@ -617,7 +659,9 @@ impl GdnWeights {
         let y_flat = y.reshape(((), self.value_head_dim))?;
         let z_flat = z.reshape(((), self.value_head_dim))?;
         let y_normed = rms_norm_gated(&y_flat, &z_flat, &self.norm_weight, self.rms_norm_eps)?;
-        let y_out = y_normed.reshape(val_shape)?.reshape((batch, seq_len, self.value_dim))?;
+        let y_out = y_normed
+            .reshape(val_shape)?
+            .reshape((batch, seq_len, self.value_dim))?;
 
         // 8. Output projection
         Self::linear(&y_out, &self.out_proj)
@@ -638,7 +682,9 @@ fn rms_norm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) -> Resul
     let gate_f32 = candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?;
     let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
     let normed = x_f32.broadcast_div(&(var + eps)?.sqrt()?)?;
-    let out = normed.broadcast_mul(&weight.to_dtype(DType::F32)?)?.mul(&gate_f32)?;
+    let out = normed
+        .broadcast_mul(&weight.to_dtype(DType::F32)?)?
+        .mul(&gate_f32)?;
     out.to_dtype(dtype)
 }
 
@@ -680,7 +726,10 @@ fn verify_qwen35_arch(
     metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>,
 ) -> Result<String> {
     use crate::utils::gguf_metadata::TryValueInto;
-    let actual: String = metadata.get("general.architecture").cloned().try_value_into()?;
+    let actual: String = metadata
+        .get("general.architecture")
+        .cloned()
+        .try_value_into()?;
     if actual != "qwen35" {
         candle_core::bail!("Expected `qwen35` architecture, got `{actual}`.");
     }
@@ -708,15 +757,14 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             .unwrap_or(embed_len / head_count);
         // Parse mrope_sections if present (for multimodal RoPE)
         // Values may be stored as u64 or u32 in GGUF
-        let mrope_sections: Vec<usize> = match c.get_option_value::<Vec<u64>>("rope.dimension_sections") {
-            Ok(Some(v)) => v.iter().take(3).map(|x| *x as usize).collect(),
-            _ => {
-                match c.get_option_value::<Vec<u32>>("rope.dimension_sections") {
+        let mrope_sections: Vec<usize> =
+            match c.get_option_value::<Vec<u64>>("rope.dimension_sections") {
+                Ok(Some(v)) => v.iter().take(3).map(|x| *x as usize).collect(),
+                _ => match c.get_option_value::<Vec<u32>>("rope.dimension_sections") {
                     Ok(Some(v)) => v.iter().take(3).map(|x| *x as usize).collect(),
                     _ => Vec::new(),
-                }
-            }
-        };
+                },
+            };
 
         Ok(Self {
             head_count,
@@ -942,9 +990,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     hybrid_layer_types.push(HybridLayerType::Recurrent);
                     gdn_layer_count += 1;
 
-                    let mut load_dequant = |name: &str| -> Result<Tensor> {
-                        ct.tensor(name, dev)?.dequantize(dev)
-                    };
+                    let mut load_dequant =
+                        |name: &str| -> Result<Tensor> { ct.tensor(name, dev)?.dequantize(dev) };
 
                     // QKV + tiling
                     let qkv_raw = load_dequant(&format!("{prefix}.attn_qkv.weight"))?;
@@ -1000,7 +1047,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     };
 
                     // Conv1d weights
-                    let conv_raw = ct.tensor(&format!("{prefix}.ssm_conv1d.weight"), dev)?
+                    let conv_raw = ct
+                        .tensor(&format!("{prefix}.ssm_conv1d.weight"), dev)?
                         .dequantize(dev)?;
                     let conv_weight = if conv_raw.dims().len() == 2 {
                         conv_raw.unsqueeze(1)?
@@ -1133,7 +1181,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
             1
         };
         let state_dims = if hybrid.num_v_heads > 0 {
-            vec![hybrid.num_v_heads, hybrid.key_head_dim, hybrid.value_head_dim]
+            vec![
+                hybrid.num_v_heads,
+                hybrid.key_head_dim,
+                hybrid.value_head_dim,
+            ]
         } else {
             vec![1, 1, 1]
         };
@@ -1226,12 +1278,12 @@ impl ModelWeights {
                             &mask.get(x.device()),
                             start_offsets,
                             kv_cache,
-                            metadata
-                                .as_ref()
-                                .map(|(kv, m)| (kv[i].clone(), *m)),
+                            metadata.as_ref().map(|(kv, m)| (kv[i].clone(), *m)),
                         )?
                     } else {
-                        candle_core::bail!("Hybrid cache layer {i} is not Attention for a full-attention layer");
+                        candle_core::bail!(
+                            "Hybrid cache layer {i} is not Attention for a full-attention layer"
+                        );
                     }
                 }
                 LayerImpl::LinearAttention(gdn) => {
@@ -1240,14 +1292,15 @@ impl ModelWeights {
                     {
                         let indices = state_indices.as_ref().ok_or_else(|| {
                             candle_core::Error::Msg(
-                                "GDN layers require recurrent state indices (paged-attn mode)".into(),
+                                "GDN layers require recurrent state indices (paged-attn mode)"
+                                    .into(),
                             )
                         })?;
                         let indices_vec: Vec<u32> = indices.to_vec1()?;
                         // Decode when we already have a prefill (start_offsets[0] > 0) and
                         // the current step is a single token.
-                        let is_decode = start_offsets.first().copied().unwrap_or(0) > 0
-                            && x.dim(1)? == 1;
+                        let is_decode =
+                            start_offsets.first().copied().unwrap_or(0) > 0 && x.dim(1)? == 1;
                         let seqlen_offset = start_offsets.first().copied().unwrap_or(0);
 
                         // Metal decode fast path: address pool directly via slots,
@@ -1292,7 +1345,9 @@ impl ModelWeights {
                             out
                         }
                     } else {
-                        candle_core::bail!("Hybrid cache layer {i} is not Recurrent for a GDN layer");
+                        candle_core::bail!(
+                            "Hybrid cache layer {i} is not Recurrent for a GDN layer"
+                        );
                     }
                 }
             };
