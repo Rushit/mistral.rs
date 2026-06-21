@@ -382,7 +382,8 @@ pub fn causal_conv1d_cuda(
                     _ => candle::bail!("bias must be a cuda tensor"),
                 };
                 let b_offset = b_l.start_offset();
-                b_s.slice(b_offset..).device_ptr(b_s.stream()).0 as *const c_void
+                let b_ptr = b_s.slice(b_offset..).device_ptr(b_s.stream()).0 as *const c_void;
+                b_ptr
             }
             None => std::ptr::null(),
         };

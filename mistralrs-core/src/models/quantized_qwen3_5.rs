@@ -275,6 +275,7 @@ impl FullAttnWeights {
         let k = self.k_norm.forward(&k_flat)?.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
 
         // Partial RoPE: rotate first `rope_dim` dims of each head, leave the rest unrotated.
+        let positions = crate::pipeline::text_positions_tensor(start_offsets, seq_len, q.device())?;
         let (q, k) = match &self.rotary {
             Rotary::Plain(rope) => {
                 if self.rope_dim < self.head_dim {
@@ -282,12 +283,12 @@ impl FullAttnWeights {
                     let q_pass = q.narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?.contiguous()?;
                     let k_rot = k.narrow(D::Minus1, 0, self.rope_dim)?.contiguous()?;
                     let k_pass = k.narrow(D::Minus1, self.rope_dim, self.head_dim - self.rope_dim)?.contiguous()?;
-                    let (q_rot, k_rot) = rope.forward(&q_rot, &k_rot, start_offsets)?;
+                    let (q_rot, k_rot) = rope.forward(&q_rot, &k_rot, &positions)?;
                     let q = Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?.contiguous()?;
                     let k = Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?.contiguous()?;
                     (q, k)
                 } else {
-                    rope.forward(&q, &k, start_offsets)?
+                    rope.forward(&q, &k, &positions)?
                 }
             }
             Rotary::MRope(mrope) => {
@@ -1140,6 +1141,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             conv_dim,
             conv_width: hybrid.conv_kernel_size,
             state_dims,
+            recurrent_dtype: Some(dtype),
         };
         let cache = EitherCache::Hybrid(std::sync::Arc::new(std::sync::Mutex::new(
             HybridCache::new(
@@ -1242,14 +1244,16 @@ impl ModelWeights {
                             )
                         })?;
                         let indices_vec: Vec<u32> = indices.to_vec1()?;
-                        let first_offset =
-                            pool.get_seqlen_offset(indices_vec[0] as usize);
+                        // Decode when we already have a prefill (start_offsets[0] > 0) and
+                        // the current step is a single token.
+                        let is_decode = start_offsets.first().copied().unwrap_or(0) > 0
+                            && x.dim(1)? == 1;
+                        let seqlen_offset = start_offsets.first().copied().unwrap_or(0);
 
                         // Metal decode fast path: address pool directly via slots,
                         // skipping per-layer gather/scatter (~112 Metal dispatches/token saved).
                         #[cfg(feature = "metal")]
                         {
-                            let is_decode = first_offset > 0 && x.dim(1)? == 1;
                             if x.device().is_metal() && is_decode {
                                 let slots_gpu = indices.to_device(x.device())?;
                                 let out = gdn.forward_decode_slots(
@@ -1258,10 +1262,6 @@ impl ModelWeights {
                                     &mut pool.recurrent_state,
                                     &slots_gpu,
                                 )?;
-                                for &idx in &indices_vec {
-                                    let updated = pool.get_seqlen_offset(idx as usize) + 1;
-                                    pool.set_seqlen_offset(idx as usize, updated);
-                                }
                                 out
                             } else {
                                 let conv_state = pool.gather_conv_state(indices)?;
@@ -1269,16 +1269,11 @@ impl ModelWeights {
                                 let mut gdn_cache = GdnLayerCache {
                                     conv_state,
                                     recurrent_state,
-                                    seqlen_offset: first_offset,
+                                    seqlen_offset,
                                 };
                                 let out = gdn.forward(&x, &mut gdn_cache)?;
                                 pool.scatter_conv_state(indices, &gdn_cache.conv_state)?;
                                 pool.scatter_recurrent_state(indices, &gdn_cache.recurrent_state)?;
-                                let delta = gdn_cache.seqlen_offset.saturating_sub(first_offset);
-                                for &idx in &indices_vec {
-                                    let updated = pool.get_seqlen_offset(idx as usize) + delta;
-                                    pool.set_seqlen_offset(idx as usize, updated);
-                                }
                                 out
                             }
                         }
@@ -1289,16 +1284,11 @@ impl ModelWeights {
                             let mut gdn_cache = GdnLayerCache {
                                 conv_state,
                                 recurrent_state,
-                                seqlen_offset: first_offset,
+                                seqlen_offset,
                             };
                             let out = gdn.forward(&x, &mut gdn_cache)?;
                             pool.scatter_conv_state(indices, &gdn_cache.conv_state)?;
                             pool.scatter_recurrent_state(indices, &gdn_cache.recurrent_state)?;
-                            let delta = gdn_cache.seqlen_offset.saturating_sub(first_offset);
-                            for &idx in &indices_vec {
-                                let updated = pool.get_seqlen_offset(idx as usize) + delta;
-                                pool.set_seqlen_offset(idx as usize, updated);
-                            }
                             out
                         }
                     } else {
